@@ -1,0 +1,145 @@
+name: GKI 6.6 WakacaW Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_patch_level:
+        description: "OS Patch Level (YYYY-MM)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          docker image prune -a -f || true
+          df -h
+
+      - name: Install deps
+        run: |
+          sudo apt update
+          sudo apt install -y git curl unzip bc build-essential python3 lz4
+
+      - name: Clone Build Tools
+        run: |
+          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-2025 --depth=1
+          git clone https://android.googlesource.com/platform/system/tools/mkbootimg -b main-kernel-2025 --depth=1
+          echo "AVBTOOL=$GITHUB_WORKSPACE/build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
+          echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
+
+      - name: Get repo tool
+        run: |
+          mkdir repo
+          curl https://storage.googleapis.com/git-repo-downloads/repo > repo/repo
+          chmod +x repo/repo
+          echo "REPO=$GITHUB_WORKSPACE/repo/repo" >> $GITHUB_ENV
+
+      - name: Init Kernel Source (android15-6.6)
+        run: |
+          mkdir gki
+          cd gki
+          $REPO init -u https://android.googlesource.com/kernel/manifest \
+            -b common-android15-6.6-${{ inputs.os_patch_level }} \
+            --repo-rev=v2.16 --depth=1
+
+      - name: Repo Sync
+        run: |
+          cd gki
+          $REPO sync -c -j$(nproc) --no-tags --fail-fast
+
+      - name: Extract SUBLEVEL
+        run: |
+          cd gki/common
+          SUB=$(grep "^SUBLEVEL =" Makefile | awk '{print $3}')
+          echo "SUBLEVEL=$SUB" >> $GITHUB_ENV
+
+      - name: Apply glibc fixes
+        run: |
+          cd gki/common
+          sed -i '/\$(Q)\$(MAKE) -C \$(SUBCMD_SRC)/s//$(Q)$(MAKE) -C $(SUBCMD_SRC) EXTRA_CFLAGS="$(CFLAGS)"/' tools/bpf/resolve_btfids/Makefile || true
+
+      - name: Enable SND ALOOP + USB Gadget Audio
+        run: |
+          cd gki/common
+          DEF=arch/arm64/configs/gki_defconfig
+          echo "" >> $DEF
+          echo "# Audio + Gadget Mods" >> $DEF
+          echo "CONFIG_SND=y" >> $DEF
+          echo "CONFIG_SND_ALOOP=m" >> $DEF
+          echo "CONFIG_USB_GADGET=y" >> $DEF
+          echo "CONFIG_USB_LIBCOMPOSITE=m" >> $DEF
+          echo "CONFIG_USB_CONFIGFS=y" >> $DEF
+          echo "CONFIG_USB_CONFIGFS_F_UAC1=y" >> $DEF
+          echo "CONFIG_USB_CONFIGFS_F_UAC2=y" >> $DEF
+
+      - name: ABI Bypass
+        run: |
+          cd gki
+          sed -i 's/exit 1/echo "ABI bypass"/' build/kernel/abi/check_buildtime_symbol_protection.py || true
+
+      - name: Module Bypass
+        run: |
+          cd gki/common
+          if [ -f kernel/module/version.c ]; then
+            sed -i 's/return 0;/return 1;/' kernel/module/version.c
+          fi
+
+      - name: Change Kernel Name → WakacaW
+        run: |
+          cd gki/common
+
+          DEF=arch/arm64/configs/gki_defconfig
+
+          echo "" >> $DEF
+          echo "# Custom Kernel Name" >> $DEF
+          echo "CONFIG_LOCALVERSION=\"-WakacaW\"" >> $DEF
+
+          # remove dirty flag
+          sed -i 's/-dirty//' scripts/setlocalversion || true
+
+          # add -WakacaW suffix to git-based version
+          sed -i '$s|echo "\$res"|echo "\$res-WakacaW"|' scripts/setlocalversion
+
+          # timestamp
+          UTS_VERSION="#1 WakacaW SMP PREEMPT $(date -u +%a\ %b\ %d\ %H:%M:%S\ UTC\ %Y)"
+          perl -pi -e "s|UTS_VERSION=\".*\"|UTS_VERSION=\"${UTS_VERSION}\"|" scripts/mkcompile_h || true
+
+      - name: Build Kernel (Bazel)
+        run: |
+          cd gki
+          tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
+
+      - name: Collect Outputs
+        run: |
+          mkdir output
+          cp gki/bazel-bin/common/kernel_aarch64/Image output/
+          cp gki/bazel-bin/common/kernel_aarch64/Image.lz4 output/
+          gzip -n -k -f -9 output/Image
+
+      - name: Build boot.img
+        run: |
+          cd output
+          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
+
+      - name: Clone AnyKernel3
+        run: |
+          git clone https://github.com/heybyben/AnyKernel3.git -b wakacaw
+          cp output/Image AnyKernel3/Image
+
+      - name: Create AnyKernel ZIP
+        run: |
+          cd AnyKernel3
+          zip -r9 ../WakacaW-GKI-6.6-${{ inputs.os_patch_level }}.zip ./*
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WakacaW-GKI-6.6-${{ inputs.os_patch_level }}
+          path: |
+            output/**
+            *.zip
+          compression-level: 9
