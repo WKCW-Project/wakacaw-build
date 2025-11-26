@@ -23,6 +23,11 @@ jobs:
   build-gki:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [vanilla, sukisu]
+
     steps:
       - name: Check Initial Disk Space
         run: |
@@ -167,23 +172,30 @@ jobs:
           sed -i 's|echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"|echo "${KERNELVERSION}${config_localversion}"|' ./scripts/setlocalversion
 
       - name: Integrate SukiSU
+        if: matrix.variant == 'sukisu'
         run: |
           cd "$CONFIG/common"
+          echo "[SukiSU] Enabled"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
 
-      - name: Add support SUSFS
+      - name: Apply SUSFS
+        if: matrix.variant == 'sukisu'
         run: |
           cd "$CONFIG/common"
+          echo "[SUSFS] Enabled"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+
           cd ../
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth=1
           cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
           cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
           cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common
+
           cd common
           patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch
 
       - name: Configure SUSFS
+        if: matrix.variant == 'sukisu'
         run: |
           cd "$CONFIG"
           DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
@@ -195,17 +207,14 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
-
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
-
           echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
-
           echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
@@ -234,17 +243,18 @@ jobs:
         id: names
         run: |
           DATE=$(date -u +%Y%m%d)
-          RAND=$(shuf -i 1000-9999 -n 1)
-          FILE_NAME="WakacaW-${WKCW_VERSION}-GKI-6.6-${DATE}-${RAND}"
+          FILE_NAME="WakacaW-${WKCW_VERSION}-GKI-6.6-${DATE}-${{ matrix.variant }}"
+
           if [ "${{ inputs.release_type }}" = "release" ]; then
-            TAG="v6.6-${DATE}-${RAND}"
-            TITLE="WakacaW GKI 6.6 ${WKCW_VERSION} (${DATE})"
+            TAG="v6.6-${DATE}-${{ matrix.variant }}"
+            TITLE="WakacaW GKI 6.6 ${WKCW_VERSION} (${DATE}) - ${{ matrix.variant }}"
             MAKE_LATEST="true"
           else
-            TAG="test-6.6-${DATE}-${RAND}"
-            TITLE="WakacaW GKI 6.6 Test ${WKCW_VERSION} (${DATE})"
+            TAG="test-6.6-${DATE}-${{ matrix.variant }}"
+            TITLE="WakacaW GKI 6.6 Test ${WKCW_VERSION} (${DATE}) - ${{ matrix.variant }}"
             MAKE_LATEST="false"
           fi
+
           echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
           echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
           echo "RELEASE_TITLE=$TITLE" >> $GITHUB_ENV
@@ -262,6 +272,7 @@ jobs:
           echo "## ${{ env.FILE_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Android Version:** android15" >> $GITHUB_STEP_SUMMARY
           echo "- **Kernel:** 6.6.${{ steps.sublevel.outputs.sublevel }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Variant:** ${{ matrix.variant }}" >> $GITHUB_STEP_SUMMARY
           echo "- **OS Patch (branch):** $OS_PATCH_LEVEL" >> $GITHUB_STEP_SUMMARY
           echo "- **Build Date:** $(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
           echo "- **Release Tag:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
