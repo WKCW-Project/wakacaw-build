@@ -1,133 +1,272 @@
-name: GKI 6.6 WakacaW Build
+name: WakacaW GKI Build
+permissions:
+  contents: write
+  actions: write
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "OS Patch Level (YYYY-MM)"
+        description: 'OS patch level (YYYY-MM)'
+        required: false
+        default: ''
+      release_type:
+        description: 'Release type: Stable (release) or Test (prerelease)'
         required: true
-        type: string
+        default: 'test'
 
 jobs:
-  build:
+  build-gki:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Free Disk
+      - name: Check Initial Disk Space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          docker image prune -a -f || true
-          df -h
+          echo "===== Initial Total Disk Space in GB ====="
+          df -BG
 
-      - name: Install deps
+      - name: Free up space
         run: |
-          sudo apt update
-          sudo apt install -y git curl unzip bc build-essential python3 lz4
+          curl -L -o util_free_space.sh https://raw.githubusercontent.com/apache/arrow/main/ci/scripts/util_free_space.sh
+          chmod +x util_free_space.sh
+          ./util_free_space.sh
+          df -BG
 
-      - name: Clone Build Tools
+      - name: Set fixed variables (android15 / 6.6)
         run: |
-          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-2025 --depth=1
-          git clone https://android.googlesource.com/platform/system/tools/mkbootimg -b main-kernel-2025 --depth=1
-          echo "AVBTOOL=$GITHUB_WORKSPACE/build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
+          echo "ANDROID_VERSION=android15" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=6.6" >> $GITHUB_ENV
+          echo "CONFIG=android15-6.6" >> $GITHUB_ENV
+
+      - name: Resolve OS_PATCH_LEVEL (auto if blank)
+        run: |
+          OPL="${{ inputs.os_patch_level }}"
+          if [ -z "$OPL" ] || [ "$OPL" = "auto" ]; then
+            OPL="$(date -u +%Y-%m)"
+          fi
+          echo "OS_PATCH_LEVEL=$OPL" >> $GITHUB_ENV
+
+      - name: Setup Build Environment
+        run: |
+          AOSP_MIRROR=https://android.googlesource.com
+          BRANCH=main-kernel-2025
+          git clone $AOSP_MIRROR/kernel/prebuilts/build-tools -b $BRANCH --depth 1 kernel-build-tools &
+          git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg &
+          wait
+
+          echo "AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
           echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
+          echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem" >> $GITHUB_ENV
 
-      - name: Get repo tool
-        run: |
-          mkdir repo
-          curl https://storage.googleapis.com/git-repo-downloads/repo > repo/repo
-          chmod +x repo/repo
-          echo "REPO=$GITHUB_WORKSPACE/repo/repo" >> $GITHUB_ENV
+          mkdir -p ./git-repo
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
+          chmod a+rx ./git-repo/repo
+          echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
 
-      - name: Init Kernel Source (android15-6.6)
+      - name: Set boot sign key
+        env:
+          BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
         run: |
-          mkdir gki
-          cd gki
-          $REPO init -u https://android.googlesource.com/kernel/manifest \
-            -b common-android15-6.6-${{ inputs.os_patch_level }} \
-            --repo-rev=v2.16 --depth=1
+          if [ -n "$BOOT_SIGN_KEY" ]; then
+            echo "$BOOT_SIGN_KEY" > ./kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem
+          fi
 
-      - name: Repo Sync
+      - name: Clone AnyKernel3 (no extra patches)
         run: |
-          cd gki
+          git clone https://github.com/heybyben/AnyKernel3.git -b wakacaw
+
+      - name: Initialize and Sync Kernel Source
+        run: |
+          mkdir -p "$CONFIG"
+          cd "$CONFIG"
+          FORMATTED_BRANCH="android15-6.6-$OS_PATCH_LEVEL"
+          $REPO init -u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16 --depth=1
           $REPO sync -c -j$(nproc) --no-tags --fail-fast
 
-      - name: Extract SUBLEVEL
+      - name: Extract Kernel SUBLEVEL
+        id: sublevel
         run: |
-          cd gki/common
-          SUB=$(grep "^SUBLEVEL =" Makefile | awk '{print $3}')
-          echo "SUBLEVEL=$SUB" >> $GITHUB_ENV
+          cd "$CONFIG/common"
+          SUBLEVEL=$(grep -E '^SUBLEVEL[[:space:]]*=' Makefile | awk '{print $3}')
+          echo "SUBLEVEL=$SUBLEVEL" >> $GITHUB_ENV
+          echo "sublevel=$SUBLEVEL" >> $GITHUB_OUTPUT
 
-      - name: Apply glibc fixes
+      - name: Minor include fix for <6.6.50 (idempotent)
         run: |
-          cd gki/common
-          sed -i '/\$(Q)\$(MAKE) -C \$(SUBCMD_SRC)/s//$(Q)$(MAKE) -C $(SUBCMD_SRC) EXTRA_CFLAGS="$(CFLAGS)"/' tools/bpf/resolve_btfids/Makefile || true
-
-      - name: ABI Bypass
-        run: |
-          cd gki
-          sed -i 's/exit 1/echo "ABI bypass"/' build/kernel/abi/check_buildtime_symbol_protection.py || true
-
-      - name: Module Bypass
-        run: |
-          cd gki/common
-          if [ -f kernel/module/version.c ]; then
-            sed -i 's/return 0;/return 1;/' kernel/module/version.c
+          cd "$CONFIG/common"
+          if ! grep -qxF '#include <trace/hooks/fs.h>' ./fs/namespace.c 2>/dev/null; then
+            sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace\/hooks\/fs.h>' ./fs/namespace.c || true
           fi
 
-      - name: Change Kernel Name → WakacaW
+      - name: Disable check_defconfig
         run: |
-          cd gki/common
-          DEF=arch/arm64/configs/gki_defconfig
+          cd "$CONFIG"
+          sed -i 's/check_defconfig//' ./common/build.config.gki
 
-          # LOCALVERSION → -WakacaW (replace only, no append)
-          if grep -q '^CONFIG_LOCALVERSION=' "$DEF"; then
-            sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-WakacaW"/' "$DEF"
-          else
-            echo "WARNING: CONFIG_LOCALVERSION not found, skip renaming in defconfig"
-          fi
+      - name: Configure Kernel Features (vanilla-friendly)
+        run: |
+          cd "$CONFIG"
+          DEFCONFIG=common/arch/arm64/configs/gki_defconfig
+          {
+            echo "# Mountify"
+            echo "CONFIG_TMPFS_XATTR=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
 
-          # remove dirty flag
-          sed -i 's/-dirty//' scripts/setlocalversion || true
+            echo "# Networking"
+            echo "CONFIG_IP_NF_TARGET_TTL=y"
+            echo "CONFIG_IP6_NF_TARGET_HL=y"
+            echo "CONFIG_IP6_NF_MATCH_HL=y"
 
-          # add -WakacaW suffix to git-based version
-          sed -i '$s|echo "\$res"|echo "\$res-WakacaW"|' scripts/setlocalversion
+            echo "# TCP BBR"
+            echo "CONFIG_TCP_CONG_ADVANCED=y"
+            echo "CONFIG_TCP_CONG_BBR=y"
+            echo "CONFIG_NET_SCH_FQ=y"
 
-          # timestamp
-          UTS_VERSION="#1 WakacaW SMP PREEMPT $(date -u +%a\ %b\ %d\ %H:%M:%S\ UTC\ %Y)"
-          perl -pi -e "s|UTS_VERSION=\".*\"|UTS_VERSION=\"${UTS_VERSION}\"|" scripts/mkcompile_h || true
+            echo "# IPSet"
+            echo "CONFIG_IP_SET=y"
+            echo "CONFIG_IP_SET_MAX=65534"
+
+            echo "# Sound"
+            echo "CONFIG_SND=y"
+            echo "CONFIG_SND_ALOOP=m"
+
+            echo "# Build Optimization"
+            echo "CONFIG_LTO_CLANG_THIN=y"
+            echo "CONFIG_LTO_CLANG=y"
+
+            echo "# Branding"
+            echo 'CONFIG_LOCALVERSION="-WakacaW"'
+            echo '# CONFIG_LOCALVERSION_AUTO is not set'
+          } >> "$DEFCONFIG"
+
+          sed -i '/_COMMON_GKI_MODULES_LIST = \\[/,/\\]/ s/\\]/    "sound\/drivers\/snd-aloop.ko",\n&/' common/modules.bzl
+
+      - name: Clean Bazel exports
+        run: |
+          cd "$CONFIG"
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl || true
+          rm -rf ./common/android/abi_gki_protected_exports_* || true
+          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' ./common/BUILD.bazel || true
+
+      - name: Set custom build host
+        run: |
+          cd "$CONFIG"
+          sed -i 's|export KBUILD_BUILD_HOST=.*|export KBUILD_BUILD_HOST=byben|' build/kernel/_setup_env.sh
+
+      - name: Customize kernel localversion output
+        run: |
+          cd "$CONFIG/common"
+          sed -i 's|echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"|echo "${KERNELVERSION}${config_localversion}"|' ./scripts/setlocalversion
+
+      - name: Integrate SukiSU
+        run: |
+          cd "$CONFIG/common"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+
+      - name: Add support SUSFS
+        run: |
+          cd "$CONFIG/common"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+          cd ../
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth=1
+          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common
+          cd common
+          patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch
+
+      - name: Configure SUSFS
+        run: |
+          cd "$CONFIG"
+          DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
+
+          echo "" >> "$DEFCONFIG"
+          echo "# SUSFS Configuration" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+          echo "# CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT is not set" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
+
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
+
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
+
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
+
+      - name: Fix Kernel Timestamp (dynamic date)
+        run: |
+          cd "$CONFIG/common/init"
+          TIMESTAMP=$(date -u +"%a %b %d %H:%M:%S UTC %Y")
+          sed -i "s|build-timestamp = .*|build-timestamp = \"${TIMESTAMP}\"|" Makefile
 
       - name: Build Kernel (Bazel)
         run: |
-          cd gki
-          tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
+          cd "$CONFIG"
+          export KBUILD_BUILD_USER="byben"
+          export KBUILD_BUILD_HOST="wkcw"
+          tools/bazel build --config=fast --lto=thin \
+            //common:kernel_aarch64_dist
 
-      - name: Collect Outputs
+      - name: Prepare AnyKernel3 Image
         run: |
-          mkdir output
-          cp gki/bazel-bin/common/kernel_aarch64/Image output/
-          cp gki/bazel-bin/common/kernel_aarch64/Image.lz4 output/
-          gzip -n -k -f -9 output/Image
+          IMG="./$CONFIG/bazel-bin/common/kernel_aarch64/Image"
+          test -f "$IMG" || (echo "Error: $IMG not found" && exit 1)
+          cp "$IMG" AnyKernel3/Image
 
-      - name: Build boot.img
+      - name: Set release file + tag names
+        id: names
         run: |
-          cd output
-          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
+          DATE=$(date -u +%Y%m%d)
+          RAND=$(shuf -i 1000-9999 -n 1)
+          FILE_NAME="WakacaW-GKI-6.6-${DATE}-${RAND}"
+          if [ "${{ inputs.release_type }}" = "release" ]; then
+            TAG="v6.6-${DATE}-${RAND}"
+            TITLE="WakacaW GKI 6.6 (${DATE})"
+            MAKE_LATEST="true"
+          else
+            TAG="test-6.6-${DATE}-${RAND}"
+            TITLE="WakacaW GKI 6.6 Test (${DATE})"
+            MAKE_LATEST="false"
+          fi
+          echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=$TITLE" >> $GITHUB_ENV
+          echo "MAKE_LATEST=$MAKE_LATEST" >> $GITHUB_ENV
 
-      - name: Clone AnyKernel3
-        run: |
-          git clone https://github.com/heybyben/AnyKernel3.git -b wakacaw
-          cp output/Image AnyKernel3/Image
-
-      - name: Create AnyKernel ZIP
+      - name: Package flashable AnyKernel zip
         run: |
           cd AnyKernel3
-          zip -r9 ../WakacaW-GKI-6.6-${{ inputs.os_patch_level }}.zip ./*
+          rm -rf .git .github || true
+          zip -r9 ../${{ env.FILE_NAME }}.zip . -x "*.git*" "*.github*"
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Build Summary
+        run: |
+          echo "# Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## ${{ env.FILE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Android Version:** android15" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kernel:** 6.6.${{ steps.sublevel.outputs.sublevel }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **OS Patch (branch):** $OS_PATCH_LEVEL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Date:** $(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Tag:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Asset:** ${{ env.FILE_NAME }}.zip" >> $GITHUB_STEP_SUMMARY
+
+      - name: Publish GitHub Release (upload asset)
+        uses: softprops/action-gh-release@v2
         with:
-          name: WakacaW-GKI-6.6-${{ inputs.os_patch_level }}
-          path: |
-            output/**
-            *.zip
-          compression-level: 9
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
+          prerelease: ${{ inputs.release_type != 'release' }}
+          draft: false
+          generate_release_notes: true
+          make_latest: ${{ env.MAKE_LATEST }}
+          files: |
+            ${{ env.FILE_NAME }}.zip
