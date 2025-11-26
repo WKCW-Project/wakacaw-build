@@ -14,6 +14,10 @@ on:
         description: 'Release type: Stable (release) or Test (prerelease)'
         required: true
         default: 'test'
+      wakacaw_version:
+        description: 'WakacaW Version (example: 1.0)'
+        required: true
+        default: '1.0'
 
 jobs:
   build-gki:
@@ -103,6 +107,10 @@ jobs:
           cd "$CONFIG"
           sed -i 's/check_defconfig//' ./common/build.config.gki
 
+      - name: Set WakacaW Version
+        run: |
+          echo "WKCW_VERSION=${{ inputs.wakacaw_version }}" >> $GITHUB_ENV
+
       - name: Configure Kernel Features (vanilla-friendly)
         run: |
           cd "$CONFIG"
@@ -135,7 +143,7 @@ jobs:
             echo "CONFIG_LTO_CLANG=y"
 
             echo "# Branding"
-            echo 'CONFIG_LOCALVERSION="-WakacaW"'
+            echo "CONFIG_LOCALVERSION=\"-WakacaW-${WKCW_VERSION}\""
             echo '# CONFIG_LOCALVERSION_AUTO is not set'
           } >> "$DEFCONFIG"
 
@@ -227,14 +235,14 @@ jobs:
         run: |
           DATE=$(date -u +%Y%m%d)
           RAND=$(shuf -i 1000-9999 -n 1)
-          FILE_NAME="WakacaW-GKI-6.6-${DATE}-${RAND}"
+          FILE_NAME="WakacaW-${WKCW_VERSION}-GKI-6.6-${DATE}-${RAND}"
           if [ "${{ inputs.release_type }}" = "release" ]; then
             TAG="v6.6-${DATE}-${RAND}"
-            TITLE="WakacaW GKI 6.6 (${DATE})"
+            TITLE="WakacaW GKI 6.6 ${WKCW_VERSION} (${DATE})"
             MAKE_LATEST="true"
           else
             TAG="test-6.6-${DATE}-${RAND}"
-            TITLE="WakacaW GKI 6.6 Test (${DATE})"
+            TITLE="WakacaW GKI 6.6 Test ${WKCW_VERSION} (${DATE})"
             MAKE_LATEST="false"
           fi
           echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
