@@ -62,59 +62,6 @@ jobs:
           cd gki/common
           sed -i '/\$(Q)\$(MAKE) -C \$(SUBCMD_SRC)/s//$(Q)$(MAKE) -C $(SUBCMD_SRC) EXTRA_CFLAGS="$(CFLAGS)"/' tools/bpf/resolve_btfids/Makefile || true
 
-      - name: Enable SND ALOOP + USB Gadget Audio
-        run: |
-          cd gki/common
-          DEF=arch/arm64/configs/gki_defconfig
-
-          # CONFIG_SND → y
-          if grep -q '^CONFIG_SND=' "$DEF"; then
-            sed -i 's/^CONFIG_SND=.*/CONFIG_SND=y/' "$DEF"
-          elif grep -q '^# CONFIG_SND is not set' "$DEF"; then
-            sed -i 's/^# CONFIG_SND is not set/CONFIG_SND=y/' "$DEF"
-          else
-            echo 'CONFIG_SND=y' >> "$DEF"
-          fi
-
-          # CONFIG_SND_ALOOP → m
-          if grep -q '^CONFIG_SND_ALOOP=' "$DEF"; then
-            sed -i 's/^CONFIG_SND_ALOOP=.*/CONFIG_SND_ALOOP=m/' "$DEF"
-          else
-            echo 'CONFIG_SND_ALOOP=m' >> "$DEF"
-          fi
-
-          # CONFIG_USB_GADGET → y
-          if grep -q '^CONFIG_USB_GADGET=' "$DEF"; then
-            sed -i 's/^CONFIG_USB_GADGET=.*/CONFIG_USB_GADGET=y/' "$DEF"
-          elif grep -q '^# CONFIG_USB_GADGET is not set' "$DEF"; then
-            sed -i 's/^# CONFIG_USB_GADGET is not set/CONFIG_USB_GADGET=y/' "$DEF"
-          else
-            echo 'CONFIG_USB_GADGET=y' >> "$DEF"
-          fi
-
-          # CONFIG_USB_CONFIGFS → y
-          if grep -q '^CONFIG_USB_CONFIGFS=' "$DEF"; then
-            sed -i 's/^CONFIG_USB_CONFIGFS=.*/CONFIG_USB_CONFIGFS=y/' "$DEF"
-          elif grep -q '^# CONFIG_USB_CONFIGFS is not set' "$DEF"; then
-            sed -i 's/^# CONFIG_USB_CONFIGFS is not set/CONFIG_USB_CONFIGFS=y/' "$DEF"
-          else
-            echo 'CONFIG_USB_CONFIGFS=y' >> "$DEF"
-          fi
-
-          # CONFIG_USB_CONFIGFS_F_UAC1 → y (only add if missing)
-          if grep -q '^CONFIG_USB_CONFIGFS_F_UAC1=' "$DEF"; then
-            sed -i 's/^CONFIG_USB_CONFIGFS_F_UAC1=.*/CONFIG_USB_CONFIGFS_F_UAC1=y/' "$DEF"
-          else
-            echo 'CONFIG_USB_CONFIGFS_F_UAC1=y' >> "$DEF"
-          fi
-
-          # CONFIG_USB_CONFIGFS_F_UAC2 → y
-          if grep -q '^CONFIG_USB_CONFIGFS_F_UAC2=' "$DEF"; then
-            sed -i 's/^CONFIG_USB_CONFIGFS_F_UAC2=.*/CONFIG_USB_CONFIGFS_F_UAC2=y/' "$DEF"
-          else
-            echo 'CONFIG_USB_CONFIGFS_F_UAC2=y' >> "$DEF"
-          fi
-
       - name: ABI Bypass
         run: |
           cd gki
@@ -132,11 +79,11 @@ jobs:
           cd gki/common
           DEF=arch/arm64/configs/gki_defconfig
 
-          # LOCALVERSION → -WakacaW (replace if exists, else append)
+          # LOCALVERSION → -WakacaW (replace only, no append)
           if grep -q '^CONFIG_LOCALVERSION=' "$DEF"; then
             sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-WakacaW"/' "$DEF"
           else
-            echo 'CONFIG_LOCALVERSION="-WakacaW"' >> "$DEF"
+            echo "WARNING: CONFIG_LOCALVERSION not found, skip renaming in defconfig"
           fi
 
           # remove dirty flag
