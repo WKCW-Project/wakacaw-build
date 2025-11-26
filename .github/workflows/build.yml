@@ -234,14 +234,13 @@ jobs:
         id: names
         run: |
           DATE=$(date -u +%Y%m%d)
-          RAND=$(shuf -i 1000-9999 -n 1)
-          FILE_NAME="WakacaW-${WKCW_VERSION}-GKI-6.6-${DATE}-${RAND}"
+          FILE_NAME="WakacaW-${WKCW_VERSION}-GKI-6.6-${DATE}-SukiSU"
           if [ "${{ inputs.release_type }}" = "release" ]; then
-            TAG="v6.6-${DATE}-${RAND}"
+            TAG="v6.6-${DATE}"
             TITLE="WakacaW GKI 6.6 ${WKCW_VERSION} (${DATE})"
             MAKE_LATEST="true"
           else
-            TAG="test-6.6-${DATE}-${RAND}"
+            TAG="test-6.6-${DATE}"
             TITLE="WakacaW GKI 6.6 Test ${WKCW_VERSION} (${DATE})"
             MAKE_LATEST="false"
           fi
